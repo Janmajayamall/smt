@@ -1,73 +1,14 @@
-use node::Node;
-use serde::{Deserialize, Serialize};
 use std::{io::Error, vec::Vec};
+use tree_hasher::{Hasher, TreeHasher};
 use utils::common_prefix;
 
 mod node;
+mod tree_hasher;
 mod utils;
 trait KvStore {
     fn get(&self, k: &[u8]) -> Vec<u8>;
     fn insert(&self, k: &[u8], v: &[u8]);
     fn delete(&self, k: &[u8]);
-}
-
-trait Hasher {
-    type Hash: Copy + PartialEq + Into<Vec<u8>> + TryFrom<Vec<u8>>;
-    fn hash(&self, data: &[u8]) -> Self::Hash;
-    fn output_size(&self) -> usize;
-}
-
-#[derive(Clone)]
-struct TreeHasher<H: Hasher> {
-    hasher: H,
-    zero_hash: Vec<u8>,
-}
-
-impl<H: Hasher> TreeHasher<H> {
-    const NODE_PREFIX: [u8; 1] = [1];
-    const LEAF_PREFIX: [u8; 1] = [0];
-
-    fn path(&self, key: &[u8]) -> Vec<u8> {
-        self.hasher.hash(key).into()
-    }
-
-    pub fn digest(&self, data: &[u8]) -> Vec<u8> {
-        self.hasher.hash(&data).into()
-    }
-
-    pub fn digest_node(&self, left: &[u8], right: &[u8]) -> (Vec<u8>, Vec<u8>) {
-        let mut data = Self::NODE_PREFIX.to_vec();
-        data.extend_from_slice(left);
-        data.extend_from_slice(right);
-        (self.hasher.hash(&data).into(), data)
-    }
-
-    pub fn digest_leaf(&self, path: &[u8], value: &[u8]) -> (Vec<u8>, Vec<u8>) {
-        let mut data = Self::LEAF_PREFIX.to_vec();
-        data.extend_from_slice(path);
-        data.extend_from_slice(value);
-        (self.hasher.hash(&data).into(), data)
-    }
-
-    pub fn parse_leaf(&self, data: &[u8]) -> (Vec<u8>, Vec<u8>) {
-        (
-            data[Self::LEAF_PREFIX.len()..self.hasher.output_size() + Self::LEAF_PREFIX.len()]
-                .to_vec(),
-            data[self.hasher.output_size() + Self::LEAF_PREFIX.len()..].to_vec(),
-        )
-    }
-
-    pub fn parse_node(&self, data: &[u8]) -> (Vec<u8>, Vec<u8>) {
-        (
-            data[Self::NODE_PREFIX.len()..self.hasher.output_size() + Self::LEAF_PREFIX.len()]
-                .to_vec(),
-            data[self.hasher.output_size() + Self::LEAF_PREFIX.len()..].to_vec(),
-        )
-    }
-
-    pub fn is_leaf(&self, data: &[u8]) -> bool {
-        data[..Self::NODE_PREFIX.len()] == Self::NODE_PREFIX
-    }
 }
 
 struct SparseMerkleTree<H: Hasher, K: KvStore + Default> {
@@ -87,17 +28,12 @@ impl<H: Hasher, K: KvStore + Default> SparseMerkleTree<H, K> {
         }
     }
 
-    /**
-     * 1. Check that root is not default -
-     *      If it is default, then return default value (i.e. vec![0])
-     * 2. Convert key to path and then the respective value
-     */
     pub fn get(&self, key: &[u8]) -> Vec<u8> {
-        if self.root == self.tree_hasher.zero_hash {
+        if self.root == self.placeholder() {
             vec![0]
         } else {
-            let path = self.tree_hasher.hasher.hash(key);
-            self.values.get(&path.into())
+            let path = self.tree_hasher.path(key);
+            self.values.get(&path)
         }
     }
 
@@ -108,9 +44,8 @@ impl<H: Hasher, K: KvStore + Default> SparseMerkleTree<H, K> {
     ) -> anyhow::Result<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
         // keys of the nodes
         let mut sidenodes = Vec::<Vec<u8>>::new();
-        let mut pathnodes = Vec::<Vec<u8>>::new();
         // root is by default part of the path
-        pathnodes.push(root.to_vec());
+        let mut pathnodes = vec![root.to_vec()];
 
         if root == self.placeholder() {
             return Ok((sidenodes, pathnodes));
@@ -186,7 +121,9 @@ impl<H: Hasher, K: KvStore + Default> SparseMerkleTree<H, K> {
             // the new node and exisiting leaf node aren't
             // in different subtrees with rest of the nodes
             // as empty nodes (i.e. extend until they have
-            common_prefix_len = common_prefix(&pathnodes[0], path);
+            //
+            // extension_length = common_prefix_len - sidenodes.len()
+            common_prefix_len = common_prefix(&pathnodes[0], path) - sidenodes.len();
         }
 
         if common_prefix_len != self.depth() {
@@ -198,25 +135,84 @@ impl<H: Hasher, K: KvStore + Default> SparseMerkleTree<H, K> {
                 // right
                 (curr_data, curr_val) = self.tree_hasher.digest_node(&pathnodes[0], &curr_data);
             }
-
             self.nodes.insert(&curr_data, &curr_val);
         } else {
             // if value exists then delete it
         }
 
-        // TODO delete path nodes at indexes 1..
-
-        for node in pathnodes {
-            self.nodes.delete(node);
-            // TODO also delete values
+        // Delete pathnodes since they will be
+        // updated right after.
+        for (i, node) in pathnodes.iter().enumerate() {
+            if i != 0 {
+                self.nodes.delete(node);
+            }
         }
 
-        // for p in 0...self.depth() {
+        let leaf_offset = self.depth() - sidenodes.len();
+        let mut sidenode;
+        for i in 0..self.depth() {
+            if i < leaf_offset {
+                if common_prefix_len != self.depth() && common_prefix_len > self.depth() - i - 1 {
+                    // Since common_prefix is greater than depth
+                    // extend the tree with placholder as the sidenode
+                    sidenode = self.placeholder();
+                } else {
+                    continue;
+                }
+            } else {
+                sidenode = sidenodes[i - leaf_offset].clone();
+            }
 
-        // }
+            if path[self.depth() - i - 1] == 0 {
+                (curr_data, curr_val) = self.tree_hasher.digest_node(&curr_data, &sidenode);
+            } else {
+                (curr_data, curr_val) = self.tree_hasher.digest_node(&sidenode, &curr_data);
+            }
+
+            self.nodes.insert(&curr_data, &curr_val);
+        }
 
         // set value
         self.values.insert(path, value);
+    }
+
+    pub fn delete(&self, path: &[u8], sidenodes: &[Vec<u8>], pathnodes: &[Vec<u8>]) {
+        // If the node at path isn't leaf
+        // then we must return
+        if !self.tree_hasher.is_leaf(&pathnodes[0]) {
+            return;
+        }
+
+        // delete all pathnodes
+        for i in pathnodes {
+            self.nodes.delete(i);
+        }
+
+        // On deleting the leaf node we turn the
+        // node into a placeholder. Therefore, we must
+        // contract tree (i.e. bubble up) until a non-placeholder
+        // sibling.
+        let mut curr_data = Vec::<u8>::new();
+        let mut curr_val = Vec::<u8>::new();
+        let mut flag: bool = false;
+        for i in 0..sidenodes.len() {
+            if !flag {
+                if sidenodes[i] != self.placeholder() {
+                    // found a non-placeholder sibling
+                    curr_data = sidenodes[i].to_vec();
+                    flag = true;
+                }
+                continue;
+            }
+
+            if path[sidenodes.len() - i - 1] == 0 {
+                (curr_data, curr_val) = self.tree_hasher.digest_node(&curr_data, &sidenodes[i]);
+                self.nodes.insert(&curr_data, &curr_val);
+            }
+        }
+
+        // delete value at path
+        self.values.delete(path);
     }
 
     fn depth(&self) -> usize {
