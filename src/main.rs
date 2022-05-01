@@ -19,6 +19,8 @@ struct SparseMerkleTree<H: Hasher, K: KvStore + Default> {
 }
 
 impl<H: Hasher, K: KvStore + Default> SparseMerkleTree<H, K> {
+    const DEFAULT_VALUE: Vec<u8> = vec![];
+
     pub fn new(tree_hasher: TreeHasher<H>) -> Self {
         Self {
             root: tree_hasher.zero_hash.clone(),
@@ -41,14 +43,14 @@ impl<H: Hasher, K: KvStore + Default> SparseMerkleTree<H, K> {
         &self,
         root: &[u8],
         path: &[u8],
-    ) -> anyhow::Result<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
+    ) -> anyhow::Result<(Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<u8>)> {
         // keys of the nodes
         let mut sidenodes = Vec::<Vec<u8>>::new();
         // root is by default part of the path
         let mut pathnodes = vec![root.to_vec()];
 
         if root == self.placeholder() {
-            return Ok((sidenodes, pathnodes));
+            return Ok((sidenodes, pathnodes, Self::DEFAULT_VALUE));
         }
 
         // Node corresponding to root hash should exist
@@ -56,7 +58,7 @@ impl<H: Hasher, K: KvStore + Default> SparseMerkleTree<H, K> {
         if self.tree_hasher.is_leaf(&node) {
             // if root is leaf, then it does not have
             // sidenodes
-            return Ok((sidenodes, pathnodes));
+            return Ok((sidenodes, pathnodes, Self::DEFAULT_VALUE));
         }
 
         let mut k_pathnode: Vec<u8>;
@@ -78,6 +80,7 @@ impl<H: Hasher, K: KvStore + Default> SparseMerkleTree<H, K> {
             pathnodes.push(k_pathnode.clone());
 
             if k_pathnode == self.placeholder() {
+                node = Self::DEFAULT_VALUE;
                 break;
             }
 
@@ -90,14 +93,22 @@ impl<H: Hasher, K: KvStore + Default> SparseMerkleTree<H, K> {
 
         sidenodes.reverse();
         pathnodes.reverse();
-        Ok((sidenodes, pathnodes))
+        Ok((sidenodes, pathnodes, node))
     }
 
-    pub fn update(&self, path: &[u8], value: &[u8], sidenodes: &[Vec<u8>], pathnodes: &[Vec<u8>]) {
+    fn _update(
+        &self,
+        path: &[u8],
+        value: &[u8],
+        sidenodes: &[Vec<u8>],
+        pathnodes: &[Vec<u8>],
+        // old_data is non-default only when pathnode[0] is a leaf.
+        old_data: &[u8],
+    ) -> Vec<u8> {
         // Create leaf node for new value
         let val_hash = self.tree_hasher.digest(value);
-        let (mut curr_data, mut curr_val) = self.tree_hasher.digest_leaf(path, &val_hash);
-        self.nodes.insert(&curr_data, &curr_val);
+        let (mut curr_hash, mut curr_data) = self.tree_hasher.digest_leaf(path, &val_hash);
+        self.nodes.insert(&curr_hash, &curr_data);
 
         // If pathnode at index 0 is a placeholder
         // then we can simply replace it with the new
@@ -112,32 +123,46 @@ impl<H: Hasher, K: KvStore + Default> SparseMerkleTree<H, K> {
         // subtrees (with rest empty nodes) for each and extend
         // current tree with siblings as placeholders till parent node
         // of the subtrees.
-        let mut common_prefix_len;
+        let common_prefix_len;
+        let mut pathnode_value_hash = Self::DEFAULT_VALUE;
         if pathnodes[0] == self.placeholder() {
             common_prefix_len = self.depth();
         } else {
-            // Node at the bottom of path is another leaf.
-            // Therefore, we must extend the subtree until
+            // Node at the end of path there is either
+            // another leaf OR same leaf. If it's another leaf
+            // then we must extend the subtree until
             // the new node and exisiting leaf node aren't
             // in different subtrees with rest of the nodes
-            // as empty nodes (i.e. extend until they have
+            // as empty nodes.
             //
             // extension_length = common_prefix_len - sidenodes.len()
-            common_prefix_len = common_prefix(&pathnodes[0], path) - sidenodes.len();
+            let pathnode_path;
+            (pathnode_path, pathnode_value_hash) = self.tree_hasher.parse_leaf(old_data);
+            common_prefix_len = common_prefix(&pathnode_path, path);
         }
 
         if common_prefix_len != self.depth() {
-            // create 2 new subtrees and get their parent node
+            // create 2 new subtrees and calc their (parent) internal node
             if path[common_prefix_len] == 0 {
                 // left
-                (curr_data, curr_val) = self.tree_hasher.digest_node(&curr_data, &pathnodes[0]);
+                (curr_hash, curr_data) = self.tree_hasher.digest_node(&curr_hash, &pathnodes[0]);
             } else {
                 // right
-                (curr_data, curr_val) = self.tree_hasher.digest_node(&pathnodes[0], &curr_data);
+                (curr_hash, curr_data) = self.tree_hasher.digest_node(&pathnodes[0], &curr_hash);
             }
-            self.nodes.insert(&curr_data, &curr_val);
-        } else {
-            // if value exists then delete it
+            self.nodes.insert(&curr_hash, &curr_data);
+        } else if pathnode_value_hash != Self::DEFAULT_VALUE {
+            // If val hash of leaf at path end is
+            // same as val hash we are trying to add,
+            // then return exisitng root since there's
+            // no actual update.
+            if pathnode_value_hash == val_hash {
+                return self.root.clone();
+            }
+
+            // Otherwise delete existing value
+            self.nodes.delete(&pathnodes[0]);
+            self.values.delete(path);
         }
 
         // Delete pathnodes since they will be
@@ -154,7 +179,7 @@ impl<H: Hasher, K: KvStore + Default> SparseMerkleTree<H, K> {
             if i < leaf_offset {
                 if common_prefix_len != self.depth() && common_prefix_len > self.depth() - i - 1 {
                     // Since common_prefix is greater than depth
-                    // extend the tree with placholder as the sidenode
+                    // extend the tree using placeholder as sidenodes.
                     sidenode = self.placeholder();
                 } else {
                     continue;
@@ -164,23 +189,25 @@ impl<H: Hasher, K: KvStore + Default> SparseMerkleTree<H, K> {
             }
 
             if path[self.depth() - i - 1] == 0 {
-                (curr_data, curr_val) = self.tree_hasher.digest_node(&curr_data, &sidenode);
+                (curr_hash, curr_data) = self.tree_hasher.digest_node(&curr_hash, &sidenode);
             } else {
-                (curr_data, curr_val) = self.tree_hasher.digest_node(&sidenode, &curr_data);
+                (curr_hash, curr_data) = self.tree_hasher.digest_node(&sidenode, &curr_hash);
             }
 
-            self.nodes.insert(&curr_data, &curr_val);
+            self.nodes.insert(&curr_hash, &curr_data);
         }
 
         // set value
         self.values.insert(path, value);
+
+        curr_hash
     }
 
-    pub fn delete(&self, path: &[u8], sidenodes: &[Vec<u8>], pathnodes: &[Vec<u8>]) {
+    fn _delete(&self, path: &[u8], sidenodes: &[Vec<u8>], pathnodes: &[Vec<u8>]) -> Vec<u8> {
         // If the node at path isn't leaf
         // then we must return
         if !self.tree_hasher.is_leaf(&pathnodes[0]) {
-            return;
+            return self.root.clone();
         }
 
         // delete all pathnodes
@@ -192,27 +219,53 @@ impl<H: Hasher, K: KvStore + Default> SparseMerkleTree<H, K> {
         // node into a placeholder. Therefore, we must
         // contract tree (i.e. bubble up) until a non-placeholder
         // sibling.
+        let mut curr_hash = Vec::<u8>::new();
         let mut curr_data = Vec::<u8>::new();
-        let mut curr_val = Vec::<u8>::new();
         let mut flag: bool = false;
         for i in 0..sidenodes.len() {
             if !flag {
                 if sidenodes[i] != self.placeholder() {
-                    // found a non-placeholder sibling
-                    curr_data = sidenodes[i].to_vec();
+                    // We found the first non-placeholder
+                    // sibling
                     flag = true;
+
+                    curr_hash = sidenodes[i].clone();
                 }
                 continue;
             }
 
             if path[sidenodes.len() - i - 1] == 0 {
-                (curr_data, curr_val) = self.tree_hasher.digest_node(&curr_data, &sidenodes[i]);
-                self.nodes.insert(&curr_data, &curr_val);
+                (curr_hash, curr_data) = self.tree_hasher.digest_node(&curr_hash, &sidenodes[i]);
+            } else {
+                (curr_hash, curr_data) = self.tree_hasher.digest_node(&sidenodes[i], &curr_hash);
             }
+            self.nodes.insert(&curr_hash, &curr_data);
         }
 
         // delete value at path
         self.values.delete(path);
+
+        curr_hash
+    }
+
+    pub fn update(&mut self, key: &[u8], value: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.update_for_root(key, value)
+    }
+
+    pub fn delete(&mut self, key: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.update_for_root(key, &Self::DEFAULT_VALUE)
+    }
+
+    fn update_for_root(&mut self, key: &[u8], value: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let path = self.tree_hasher.path(key);
+        let (sidenodes, pathnodes, old_data) = self.sidenodes(&self.root, &path)?;
+
+        if value == Self::DEFAULT_VALUE {
+            self.root = self._delete(&path, &sidenodes, &pathnodes);
+        } else {
+            self.root = self._update(&path, value, &sidenodes, &pathnodes, &old_data);
+        }
+        Ok(self.root.clone())
     }
 
     fn depth(&self) -> usize {
