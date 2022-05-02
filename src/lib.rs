@@ -1,21 +1,45 @@
-use std::{io::Error, vec::Vec};
-use tree_hasher::{Hasher, TreeHasher};
-use utils::common_prefix;
-
 mod node;
 mod tree_hasher;
 mod utils;
-trait KvStore {
+
+use self::utils::{common_prefix, set_msb_at};
+use std::vec::Vec;
+use tree_hasher::{Hasher, TreeHasher};
+
+pub trait KvStore {
     fn get(&self, k: &[u8]) -> Vec<u8>;
     fn insert(&self, k: &[u8], v: &[u8]);
     fn delete(&self, k: &[u8]);
 }
 
-struct SparseMerkleTree<H: Hasher, K: KvStore + Default> {
+pub struct SparseMerkleTree<H: Hasher, K: KvStore + Default> {
     tree_hasher: TreeHasher<H>,
     nodes: K,
     values: K,
     root: Vec<u8>,
+}
+
+pub struct SparseMerkleProof {
+    /// Sidenodes for key down from root
+    /// to bottom of the tree
+    sidenodes: Vec<Vec<u8>>,
+    /// Used for proving the key value is
+    /// non existant
+    non_membership_leaf_node: Vec<u8>,
+}
+
+pub struct SparseMerkleCompactProof {
+    /// Sidenodes for key down from root
+    /// to bottom of the tree after excluding
+    /// all placeholders
+    compact_sidenodes: Vec<Vec<u8>>,
+    /// Used for proving the key value is
+    /// non existant
+    non_membership_leaf_node: Vec<u8>,
+    /// Bitmask indicating at which index
+    /// (i.e. index corresponding to 1 bit) to
+    /// use placeholders for proof
+    bitmask: Vec<u8>,
 }
 
 impl<H: Hasher, K: KvStore + Default> SparseMerkleTree<H, K> {
@@ -275,8 +299,54 @@ impl<H: Hasher, K: KvStore + Default> SparseMerkleTree<H, K> {
     fn placeholder(&self) -> Vec<u8> {
         self.tree_hasher.zero_hash.clone()
     }
-}
 
-fn main() {
-    println!("Hello, world!");
+    /// Generates `SparseMerkleProof` for a `key` in the
+    /// `root`.
+    pub fn generate_proof(&self, key: &[u8], root: &[u8]) -> anyhow::Result<SparseMerkleProof> {
+        let path = self.tree_hasher.path(key);
+
+        let (sidenodes, pathnodes, leaf_data) = self.sidenodes(root, &path)?;
+
+        let mut non_membership_leaf_node = Vec::<u8>::new();
+        // If `pathnodes[0]` is a placeholder, it means
+        // value corresponding to key is nil in the tree
+        if pathnodes[0] != self.placeholder() {
+            let (leaf_path, _) = self.tree_hasher.parse_leaf(&leaf_data);
+            // If `path` does not match with `leaf_path`, then `leaf_data`
+            // corresponds to some key other than give `key`. This proves
+            // that value corresponding to `key` is non existent.
+            if leaf_path != path {
+                non_membership_leaf_node = pathnodes[0].clone();
+            }
+        }
+
+        Ok(SparseMerkleProof {
+            sidenodes,
+            non_membership_leaf_node,
+        })
+    }
+
+    pub fn generate_compact_proof(
+        &self,
+        key: &[u8],
+        root: &[u8],
+    ) -> anyhow::Result<SparseMerkleCompactProof> {
+        let proof = self.generate_proof(key, root)?;
+
+        let mut compact_sidenodes = Vec::<Vec<u8>>::new();
+        let mut bitmask = Vec::<u8>::new();
+        for (index, s) in proof.sidenodes.iter().enumerate() {
+            if *s != self.placeholder() {
+                compact_sidenodes.push(s.clone());
+            } else {
+                set_msb_at(&mut bitmask, index);
+            }
+        }
+
+        Ok(SparseMerkleCompactProof {
+            compact_sidenodes,
+            bitmask,
+            non_membership_leaf_node: proof.non_membership_leaf_node,
+        })
+    }
 }
