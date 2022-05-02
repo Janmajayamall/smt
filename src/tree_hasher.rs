@@ -14,12 +14,17 @@ impl<H: Hasher> TreeHasher<H> {
     const NODE_PREFIX: [u8; 1] = [1];
     const LEAF_PREFIX: [u8; 1] = [0];
 
+    pub fn new(hasher: H) -> Self {
+        let zero_hash = vec![0; hasher.output_size()];
+        Self { hasher, zero_hash }
+    }
+
     pub fn path(&self, key: &[u8]) -> Vec<u8> {
         self.hasher.hash(key).into()
     }
 
     pub fn digest(&self, data: &[u8]) -> Vec<u8> {
-        self.hasher.hash(&data).into()
+        self.hasher.hash(data).into()
     }
 
     pub fn digest_node(&self, left: &[u8], right: &[u8]) -> (Vec<u8>, Vec<u8>) {
@@ -53,6 +58,6 @@ impl<H: Hasher> TreeHasher<H> {
     }
 
     pub fn is_leaf(&self, data: &[u8]) -> bool {
-        data[..Self::NODE_PREFIX.len()] == Self::NODE_PREFIX
+        data[..Self::LEAF_PREFIX.len()] == Self::LEAF_PREFIX
     }
 }
