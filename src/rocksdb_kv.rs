@@ -24,7 +24,7 @@ impl KvStore for RocksDbStore {
     }
 
     fn insert(&self, k: &[u8], v: &[u8]) -> anyhow::Result<()> {
-        println!("inseting k {:?} v {:?}", k, v);
+        // println!("inseting k {:?} v {:?}", k, v);
         self.db.put(k, v).map_err(|e| e.into())
     }
 

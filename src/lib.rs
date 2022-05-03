@@ -4,7 +4,10 @@ pub mod tree_hasher;
 mod utils;
 
 use self::utils::{common_prefix, get_msb_at, set_msb_at};
-use std::vec::Vec;
+use std::{
+    fmt::{self, Pointer},
+    vec::Vec,
+};
 use tree_hasher::{Hasher, TreeHasher};
 
 pub trait KvStore {
@@ -130,13 +133,17 @@ impl<H: Hasher, K: KvStore> SparseMerkleTree<H, K> {
         // old_data is non-default only when pathnode[0] is a leaf.
         old_data: &[u8],
     ) -> anyhow::Result<Vec<u8>> {
-        // println!("sidenodes {:?}", sidenodes);
-        // println!("pathnodes {:?}", pathnodes);
-        // println!("olddata {:?}", old_data);
+        // println!("sidenodes {:#x?}", sidenodes);
+        // println!("pathnodes {:x?}", pathnodes);
+        // println!("olddata {:x?}", old_data);
 
         // Create leaf node for new value
         let val_hash = self.tree_hasher.digest(value);
         let (mut curr_hash, mut curr_data) = self.tree_hasher.digest_leaf(path, &val_hash);
+        // println!(
+        //     "path {:x?} node hash {:x?} node data {:x?}",
+        //     path, curr_hash, curr_data
+        // );
         self.nodes.insert(&curr_hash, &curr_data)?;
 
         // If pathnode at index 0 is a placeholder
@@ -168,10 +175,12 @@ impl<H: Hasher, K: KvStore> SparseMerkleTree<H, K> {
             let pathnode_path;
             (pathnode_path, pathnode_value_hash) = self.tree_hasher.parse_leaf(old_data);
             common_prefix_len = common_prefix(&pathnode_path, path);
+            // println!("common_prefix_len = {}", common_prefix_len);
         }
 
         if common_prefix_len != self.depth() {
             // create 2 new subtrees and calc their (parent) internal node
+            // println!("bit value {}", get_msb_at(path, common_prefix_len));
             if get_msb_at(path, common_prefix_len) == 0 {
                 // left
                 (curr_hash, curr_data) = self.tree_hasher.digest_node(&curr_hash, &pathnodes[0]);
@@ -179,6 +188,7 @@ impl<H: Hasher, K: KvStore> SparseMerkleTree<H, K> {
                 // right
                 (curr_hash, curr_data) = self.tree_hasher.digest_node(&pathnodes[0], &curr_hash);
             }
+            // println!("node hash {:x?} node data {:x?}", curr_hash, curr_data);
             self.nodes.insert(&curr_hash, &curr_data)?;
         } else if pathnode_value_hash != Self::DEFAULT_VALUE {
             // If val hash of leaf at path end is
@@ -238,9 +248,13 @@ impl<H: Hasher, K: KvStore> SparseMerkleTree<H, K> {
         sidenodes: &[Vec<u8>],
         pathnodes: &[Vec<u8>],
     ) -> anyhow::Result<Vec<u8>> {
-        // If the node at path isn't leaf
-        // then we must return
-        if !self.tree_hasher.is_leaf(&pathnodes[0]) {
+        // println!("path {:x?}", path);
+        // println!("sidenodes {:x?}", sidenodes);
+        // println!("pathnodes {:x?}", pathnodes);
+
+        // If the node at `pathnodes[0]` is placeholder
+        // then return since no value exists at `path`
+        if pathnodes[0] == self.placeholder() {
             return Ok(self.root.clone());
         }
 
@@ -253,19 +267,30 @@ impl<H: Hasher, K: KvStore> SparseMerkleTree<H, K> {
         // node into a placeholder. Therefore, we must
         // contract tree (i.e. bubble up) until a non-placeholder
         // sibling.
-        let mut curr_hash = Vec::<u8>::new();
+        // Note that if first non-placholder sibling is leaf,
+        // it must be bubbled up again (since we collapsee a subtree
+        // with one node into a single node). Otherwise the node
+        // must be left in-place.
+        let mut curr_hash = self.placeholder();
         let mut curr_data = Vec::<u8>::new();
         let mut flag: bool = false;
         for i in 0..sidenodes.len() {
             if !flag {
                 if sidenodes[i] != self.placeholder() {
-                    // We found the first non-placeholder
-                    // sibling
-                    flag = true;
-
-                    curr_hash = sidenodes[i].clone();
+                    if curr_hash == self.placeholder()
+                        && self.tree_hasher.is_leaf(&self.nodes.get(&sidenodes[i])?)
+                    {
+                        // Sidenode is a leaf, sp bubble up till next non-placholder
+                        curr_hash = sidenodes[i].clone();
+                        continue;
+                    } else {
+                        // Sidenode is internal node, so leave it in-place
+                        // and calculate nodes above with curr_hash as placeholder
+                        flag = true;
+                    }
+                } else {
+                    continue;
                 }
-                continue;
             }
 
             if get_msb_at(path, sidenodes.len() - i - 1) == 0 {
@@ -374,7 +399,30 @@ mod tests {
         let nodes = RocksDbStore::new("./db/nodes");
         let values = RocksDbStore::new("./db/values");
         let mut smt = SparseMerkleTree::new(tree_hasher, nodes, values);
-        assert!(smt.update(b"1312121", b"13121").is_ok());
-        assert!(smt.update(b"1312121", b"13121121").is_ok());
+
+        let k1 = b"k1";
+        let v1 = b"v1";
+        let k2 = b"k2";
+        let v2 = b"v2";
+
+        println!("Update K1");
+        let res = smt.update(k1, v1).unwrap();
+        println!("root {:x?} ", res);
+        let res = smt.get(k1).unwrap();
+        assert!(res == v1);
+
+        println!("Update K2");
+        let res = smt.update(k2, v2).unwrap();
+        println!("root {:x?} ", res);
+        let res = smt.get(k2).unwrap();
+        assert!(res == v2);
+
+        println!("Delete k2...");
+        let res = smt.delete(k2).unwrap();
+        println!("root {:x?} ", res);
+        // println!("root 2  {:x?} {:x?}", root1, res.unwrap());
+        // assert!(root1 == res.unwrap());
+
+        // println!("root {:x?}", smt.root);
     }
 }
